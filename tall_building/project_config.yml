@@ -1,0 +1,62 @@
+# --- Metadata for the App UI ---
+building_info:
+  project_name: "20-Story RC Frame Building"
+  project_owner: "User-Defined"
+  fundamental_period_x: "Not Calculated"
+  fundamental_period_y: "Not Calculated"
+  number_of_instruments: 3
+
+
+# --- NEW: Earthquake Event Metadata ---
+event_metadata:
+  event_name: "Paratebueno-Cundinamarca"
+  date_time: "2025-07-31 10:30:00 UTC"
+  epicentral_distance_km: 250.0
+  site_location: "Medellín, Antioquia"
+  max_recorded_acceleration_g: 0.45
+
+
+# --- Parameters for PullOver Analysis ---
+analysis_setup:
+  # Values taken from your analysis.py script
+  instrumented_nodes: [62, 116, 188]
+  # NEW: Explicitly define all master nodes for mass assignment and recording
+  master_nodes: [17, 26, 35, 44, 53, 62, 71, 80, 89, 98, 107, 116, 125, 134, 143, 152, 161, 170, 179, 188]
+  dt: 0.02
+  npts: 4502
+
+# --- Parameters for Damage Detection ---
+damage_detection:
+  yield_parameters:
+    # These sections correspond to the different element types in your model.py
+    # I have extracted the yield moments and calculated the yield curvatures.
+    column_C1:
+      My_yield_x: 3000000.0
+      Mz_yield_x: 3000000.0
+      phi_yield_y: 0.05  # Calculated as theta_y / Lpy = 0.005 / 0.10
+      phi_yield_z: 0.05  # Calculated as theta_z / Lpz = 0.005 / 0.10
+    beam_X_B1:
+      My_yield_x: 612000.0
+      Mz_yield_x: 1650000.0
+      phi_yield_y: 0.05  # Calculated as theta_y / Lpy = 0.005 / 0.10
+      phi_yield_z: 0.05  # Calculated as theta_z / Lpz = 0.005 / 0.10
+    beam_Y_B2:
+      My_yield_y: 612000.0
+      Mz_yield_y: 1650000.0
+      phi_yield_y: 0.05  # Calculated as theta_y / Lpy = 0.005 / 0.10
+      phi_yield_z: 0.05  # Calculated as theta_z / Lpz = 0.005 / 0.10
+
+  element_ranges:
+    # I analyzed the loops in model.py to determine the ID ranges for each element type.
+    - type: column_C1
+      start_ele: 1
+      end_ele: 160
+    - type: beam_X_B1
+      start_ele: 161
+      end_ele: 260
+    - type: beam_Y_B2
+      start_ele: 261
+      end_ele: 360
+
+  # This is a user-defined assumption for cost estimation.
+  base_cost_per_element: 15000.0
