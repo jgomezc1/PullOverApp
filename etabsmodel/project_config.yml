@@ -14,7 +14,7 @@ analysis_setup:
   instrumented_nodes: [1384010, 1384011, 1384012, 1384013, 1384014, 1384015, 1384016, 1384017, 1384018]
   master_nodes:       [1384010, 1384011, 1384012, 1384013, 1384014, 1384015, 1384016, 1384017, 1384018]
   dt: 0.02
-  npts: 4502
+  npts: 1432
 damage_detection:
   yield_parameters:
     column:
