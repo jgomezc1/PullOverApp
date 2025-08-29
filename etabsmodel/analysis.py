@@ -30,10 +30,10 @@ def run_analysis_batch(analysis_params, model_module, elements_to_record, progre
     os.makedirs('damage' , exist_ok=True)
 
     # 3. ASSIGN MASS
-    M, M_r = 1.0e-6, 1.0e-6
-    for node in master_nodes:
-        if nodeCoord(node):
-            mass(node, M, M, 0.0, 0.0, 0.0, M_r)
+#    M, M_r = 1.0e-6, 1.0e-6
+#    for node in master_nodes:
+#        if nodeCoord(node):
+#            mass(node, M, M, 0.0, 0.0, 0.0, M_r)
 
     loadConst('-time', 0.0)
 
@@ -43,7 +43,7 @@ def run_analysis_batch(analysis_params, model_module, elements_to_record, progre
     
     inputs_dir = analysis_params['inputs_dir']
     for node in sub_nodes:
-        for dof, comp in zip([1, 2 , 6], ['Ux', 'Uy', 'Te']):
+        for dof, comp in zip([1, 2 ], ['Ux', 'Uy']):
             file_path = os.path.join(inputs_dir, f"master{node}_{comp}.txt")
             if not os.path.exists(file_path):
                 print(f"WARNING: Input file not found at {file_path}. Skipping.")
