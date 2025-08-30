@@ -155,25 +155,98 @@ def _map_value_to_color(val: float, vmin: float, vmax: float, cs: List[List[obje
     t = max(0.0, min(1.0, float(t)))
     return sample_colorscale(cs, t)[0]
 
-def _add_wall_face(
-    fig: go.Figure,
-    pts: List[Tuple[float, float, float]],
-    face_color: str,
-    opacity: float = 1.0,
-    legendgroup: str = 'walls',
-    hovertext: Optional[str] = None
-) -> None:
+# ---- New: merge 4-noded quads into continuous wall panels ----
+
+def _round(v: float, p: int = 3) -> float:
+    return float(np.round(v, p))
+
+def _wall_panel_groups(
+    walls: List[Tuple[int, Tuple[int, ...]]],
+    nodes: Dict[int, Tuple[float, float, float]],
+    tol_plane: float = 1e-3
+) -> List[dict]:
     """
-    Add a filled quadrilateral face for a wall using two triangles.
-    The quad is assumed to be ordered around the perimeter (0-1-2-3).
+    Merge per-story 4-noded wall quads into continuous vertical panels.
+    We detect plane orientation (X≈const or Y≈const), then group by:
+      (plane, plane_value_rounded, other_axis_edge_pair_rounded)
+    Returns a list of panels with rectangle extents.
     """
-    if len(pts) != 4:
-        return
+    groups: Dict[Tuple, dict] = {}
+
+    for _etag, conn in walls:
+        pts = [_safe_get(nodes, int(n)) for n in conn]
+        xs = np.array([p[0] for p in pts], dtype=float)
+        ys = np.array([p[1] for p in pts], dtype=float)
+        zs = np.array([p[2] for p in pts], dtype=float)
+
+        rx = float(xs.max() - xs.min())
+        ry = float(ys.max() - ys.min())
+        rz = float(zs.max() - zs.min())
+
+        # Decide plane: walls are vertical; one horizontal axis is ~constant (thickness)
+        if rx <= tol_plane and ry > tol_plane:
+            # X ≈ constant -> plane is YZ
+            plane = 'X'
+            pval = _round(xs.mean(), 3)
+            # Signature by the two distinct Y edges along the wall width
+            y0, y1 = _round(float(ys.min()), 3), _round(float(ys.max()), 3)
+            sig = (plane, pval, y0, y1)
+            if sig not in groups:
+                groups[sig] = {'plane': plane, 'pval': pval, 'a': y0, 'b': y1, 'zmin': float('inf'), 'zmax': float('-inf')}
+            groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+            groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+
+        elif ry <= tol_plane and rx > tol_plane:
+            # Y ≈ constant -> plane is XZ
+            plane = 'Y'
+            pval = _round(ys.mean(), 3)
+            x0, x1 = _round(float(xs.min()), 3), _round(float(xs.max()), 3)
+            sig = (plane, pval, x0, x1)
+            if sig not in groups:
+                groups[sig] = {'plane': plane, 'pval': pval, 'a': x0, 'b': x1, 'zmin': float('inf'), 'zmax': float('-inf')}
+            groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+            groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+        else:
+            # Fallback: choose the axis with smaller spread as the "plane" axis
+            if rx <= ry:
+                plane = 'X'
+                pval = _round(xs.mean(), 3)
+                y0, y1 = _round(float(ys.min()), 3), _round(float(ys.max()), 3)
+                sig = (plane, pval, y0, y1)
+                if sig not in groups:
+                    groups[sig] = {'plane': plane, 'pval': pval, 'a': y0, 'b': y1, 'zmin': float('inf'), 'zmax': float('-inf')}
+                groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+                groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+            else:
+                plane = 'Y'
+                pval = _round(ys.mean(), 3)
+                x0, x1 = _round(float(xs.min()), 3), _round(float(xs.max()), 3)
+                sig = (plane, pval, x0, x1)
+                if sig not in groups:
+                    groups[sig] = {'plane': plane, 'pval': pval, 'a': x0, 'b': x1, 'zmin': float('inf'), 'zmax': float('-inf')}
+                groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+                groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+
+    return list(groups.values())
+
+def _add_wall_panel_mesh(fig: go.Figure, panel: dict, color: str, hover: Optional[str]) -> None:
+    """
+    panel: {'plane': 'X'|'Y', 'pval': float, 'a': float, 'b': float, 'zmin': float, 'zmax': float}
+    Draws a single opaque rectangle (two triangles).
+    """
+    plane, pval, a, b, z0, z1 = panel['plane'], panel['pval'], panel['a'], panel['b'], panel['zmin'], panel['zmax']
+
+    if plane == 'X':
+        # Rectangle in YZ at x = pval
+        pts = [(pval, a, z0), (pval, b, z0), (pval, b, z1), (pval, a, z1)]
+    else:
+        # Rectangle in XZ at y = pval
+        pts = [(a, pval, z0), (b, pval, z0), (b, pval, z1), (a, pval, z1)]
+
     x = [p[0] for p in pts]
     y = [p[1] for p in pts]
     z = [p[2] for p in pts]
-
-    # Triangulate as (0,1,2) and (0,2,3)
+    # Indices for two triangles
     i = [0, 0]
     j = [1, 2]
     k = [2, 3]
@@ -181,16 +254,17 @@ def _add_wall_face(
     fig.add_trace(go.Mesh3d(
         x=x, y=y, z=z,
         i=i, j=j, k=k,
-        color=face_color,          # constant solid gray
-        opacity=opacity,           # fully opaque
+        color=color,
+        opacity=1.0,                 # completely solid
         flatshading=True,
-        lighting=dict(ambient=0.7, diffuse=0.9, specular=0.05, roughness=1.0),
+        lighting=dict(ambient=0.9, diffuse=0.9, specular=0.0, roughness=1.0),
         name='Wall',
-        legendgroup=legendgroup,
-        hoverinfo='text' if hovertext else 'skip',
-        hovertemplate=(hovertext + '<extra></extra>') if hovertext else None,
+        hoverinfo='text' if hover else 'skip',
+        hovertemplate=(hover + '<extra></extra>') if hover else None,
         showscale=False
     ))
+
+# -------------------------------
 
 def _add_colorbar(fig: go.Figure, cs: List[List[object]], vmin: float, vmax: float, title_text: str) -> None:
     fig.add_trace(go.Scatter3d(
@@ -284,7 +358,7 @@ def create_interactive_plot(
     # Classify elements
     x_beams, y_beams, columns, walls = classify_elements(nodes, elements)
 
-    # Prepare damage values if requested (used for non-wall members)
+    # Prepare damage values (used for beams/columns only)
     show_damage = bool(options.get('show_damage', False))
     per_ele_val: Dict[int, float] = {}
     vmin, vmax = 0.0, 1.0
@@ -344,20 +418,14 @@ def create_interactive_plot(
             p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
             draw_member(p1, p2, colors['y_beams'], 3, 'Beam-Y', 'frames', etag=etag, etype='beam-y')
 
-    # Walls: draw as a single solid gray panel (fully opaque, no outlines)
-    if options.get('show_walls', True):
-        for etag, conn in walls:
-            if not (rmin <= etag <= rmax):
-                continue
-            pts = [_safe_get(nodes, int(n)) for n in conn]
-            hover = f"<b>Element</b>: {etag}  <b>Type</b>: wall"
-            _add_wall_face(
-                fig, pts,
-                face_color=colors['walls'],
-                opacity=1.0,                   # completely solid
-                legendgroup='walls',
-                hovertext=hover
-            )
+    # Walls: merge all 4-noded quads into a SINGLE solid panel per stack
+    if options.get('show_walls', True) and walls:
+        # Build panels from all wall quads
+        all_panels = _wall_panel_groups(walls, nodes, tol_plane=1e-4)
+        for panel in all_panels:
+            # Keep per-wall simple gray look (as per requirement)
+            hover = "Wall panel"
+            _add_wall_panel_mesh(fig, panel, color=colors['walls'], hover=hover)
 
     # Node cloud
     if options.get('show_nodes', True):
@@ -376,7 +444,7 @@ def create_interactive_plot(
 
         xs, ys, zs = [], [], []
         for nid in nodes_in_range:
-            x, y, z = _safe_get(nodes, nid)
+            x, y, z = _safe_get(nodes, int(nid))
             xs.append(x); ys.append(y); zs.append(z)
         fig.add_trace(go.Scatter3d(
             x=xs, y=ys, z=zs, mode='markers',
@@ -413,7 +481,6 @@ def create_interactive_plot(
 
     # Colorbar for damage view (from beams/columns only; walls stay solid gray)
     if show_damage:
-        # If there are values from any non-wall members, show the colorbar
         non_wall_vals = [v for et, v in per_ele_val.items() if et not in {w[0] for w in walls}]
         if non_wall_vals:
             vmin2, vmax2 = _normalize(non_wall_vals)
