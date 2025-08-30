@@ -72,7 +72,7 @@ def _default_colors() -> Dict[str, str]:
         'columns':   'rgb(20,80,200)',
         'x_beams':   'rgb(20,160,80)',
         'y_beams':   'rgb(200,120,20)',
-        'walls':     'rgb(120,120,120)',
+        'walls':     'rgb(150,150,150)',  # solid wall gray
         'nodes':     'rgb(60,60,60)',
         'highlight': 'rgb(200,30,30)',
         'labels':    'black'
@@ -107,7 +107,6 @@ def _value_from_damage(ele_tag: int,
     """Return the scalar value to color the element (ductility or cost)."""
     val: Optional[float] = None
     if heatmap_mode == 'ductility':
-        # Prefer DF: max of all ductility columns for this element
         if isinstance(damage_df, pd.DataFrame) and not damage_df.empty and 'Element' in damage_df.columns:
             row = damage_df.loc[damage_df['Element'] == ele_tag]
             if not row.empty:
@@ -119,7 +118,6 @@ def _value_from_damage(ele_tag: int,
                         val = None
         if val is None and damage_map and ele_tag in damage_map:
             dm = damage_map.get(ele_tag, {})
-            # common keys we may have stored
             for k in ('max_ductility','ductility','mu','max_mu'):
                 if k in dm:
                     try:
@@ -137,7 +135,6 @@ def _value_from_damage(ele_tag: int,
                 except Exception:
                     val = None
         if val is None and damage_map and ele_tag in damage_map:
-            # If explicitly damaged but no DF, assume base_cost as a coarse proxy
             dm = damage_map.get(ele_tag, {})
             if any(isinstance(v, str) and v.lower() == 'damaged' for v in dm.values()):
                 val = float(base_cost)
@@ -158,17 +155,41 @@ def _map_value_to_color(val: float, vmin: float, vmax: float, cs: List[List[obje
     t = max(0.0, min(1.0, float(t)))
     return sample_colorscale(cs, t)[0]
 
-def _add_wall_wireframe(fig: go.Figure, pts: List[Tuple[float, float, float]], color: str, width: int = 2, legendgroup: str = 'walls', hovertext: Optional[str]=None) -> None:
-    order = [0,1,2,3,0]
-    xs = [pts[i][0] for i in order]
-    ys = [pts[i][1] for i in order]
-    zs = [pts[i][2] for i in order]
-    fig.add_trace(go.Scatter3d(
-        x=xs, y=ys, z=zs, mode='lines',
-        line=dict(color=color, width=width),
-        name='Wall', showlegend=False, legendgroup=legendgroup,
-        hoverinfo='text' if hovertext else 'none',
-        hovertemplate=(hovertext + '<extra></extra>') if hovertext else None
+def _add_wall_face(
+    fig: go.Figure,
+    pts: List[Tuple[float, float, float]],
+    face_color: str,
+    opacity: float = 1.0,
+    legendgroup: str = 'walls',
+    hovertext: Optional[str] = None
+) -> None:
+    """
+    Add a filled quadrilateral face for a wall using two triangles.
+    The quad is assumed to be ordered around the perimeter (0-1-2-3).
+    """
+    if len(pts) != 4:
+        return
+    x = [p[0] for p in pts]
+    y = [p[1] for p in pts]
+    z = [p[2] for p in pts]
+
+    # Triangulate as (0,1,2) and (0,2,3)
+    i = [0, 0]
+    j = [1, 2]
+    k = [2, 3]
+
+    fig.add_trace(go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=face_color,          # constant solid gray
+        opacity=opacity,           # fully opaque
+        flatshading=True,
+        lighting=dict(ambient=0.7, diffuse=0.9, specular=0.05, roughness=1.0),
+        name='Wall',
+        legendgroup=legendgroup,
+        hoverinfo='text' if hovertext else 'skip',
+        hovertemplate=(hovertext + '<extra></extra>') if hovertext else None,
+        showscale=False
     ))
 
 def _add_colorbar(fig: go.Figure, cs: List[List[object]], vmin: float, vmax: float, title_text: str) -> None:
@@ -198,7 +219,6 @@ def _build_hover_for_element(
     if isinstance(damage_df, pd.DataFrame) and not damage_df.empty and 'Element' in damage_df.columns:
         row = damage_df.loc[damage_df['Element'] == etag]
         if not row.empty:
-            # Damage state and cost if present
             if 'Damage State' in row.columns:
                 lines.append(f"<b>Damage</b>: {row['Damage State'].iloc[0]}")
             if 'Estimated Cost ($)' in row.columns:
@@ -207,24 +227,13 @@ def _build_hover_for_element(
                     lines.append(f"<b>Estimated Cost</b>: ${cost:,.0f}")
                 except Exception:
                     pass
-            # Show ductility columns if present
             duct_cols = [c for c in row.columns if c.startswith('Ductility')]
             if duct_cols:
                 try:
                     vals = row[duct_cols].iloc[0].astype(float)
-                    # Max ductility
                     lines.append(f"<b>Max Ductility</b>: {np.nanmax(vals):.2f}")
-                    # Display up to four hinge/axis ductilities, if present
-                    ordered_keys = ['Ductility_My_Sec1','Ductility_Mz_Sec1','Ductility_My_Sec4','Ductility_Mz_Sec4']
-                    for k in ordered_keys:
-                        if k in row.columns:
-                            try:
-                                lines.append(f"{k.replace('Ductility_','')}: {float(row[k].iloc[0]):.2f}")
-                            except Exception:
-                                pass
                 except Exception:
                     pass
-    # Also show the metric used for coloring
     if etag in per_ele_val:
         label = 'Ductility' if heatmap_mode=='ductility' else 'Estimated Cost'
         val = per_ele_val[etag]
@@ -275,7 +284,7 @@ def create_interactive_plot(
     # Classify elements
     x_beams, y_beams, columns, walls = classify_elements(nodes, elements)
 
-    # Prepare damage values if requested
+    # Prepare damage values if requested (used for non-wall members)
     show_damage = bool(options.get('show_damage', False))
     per_ele_val: Dict[int, float] = {}
     vmin, vmax = 0.0, 1.0
@@ -283,7 +292,7 @@ def create_interactive_plot(
         tmp_vals: List[float] = []
         for etag in elements.keys():
             et = int(etag)
-            if not (rmin <= et <= rmax): 
+            if not (rmin <= et <= rmax):
                 continue
             val = _value_from_damage(et, heatmap_mode, damage_map, damage_df, base_cost)
             if val is not None and math.isfinite(val):
@@ -314,7 +323,7 @@ def create_interactive_plot(
     # Columns
     if options.get('show_columns', True):
         for etag, conn in columns:
-            if not (rmin <= etag <= rmax): 
+            if not (rmin <= etag <= rmax):
                 continue
             p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
             draw_member(p1, p2, colors['columns'], 5, 'Column', 'columns', etag=etag, etype='column')
@@ -322,7 +331,7 @@ def create_interactive_plot(
     # X beams
     if options.get('show_beams_x', True):
         for etag, conn in x_beams:
-            if not (rmin <= etag <= rmax): 
+            if not (rmin <= etag <= rmax):
                 continue
             p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
             draw_member(p1, p2, colors['x_beams'], 3, 'Beam-X', 'frames', etag=etag, etype='beam-x')
@@ -330,26 +339,32 @@ def create_interactive_plot(
     # Y beams
     if options.get('show_beams_y', True):
         for etag, conn in y_beams:
-            if not (rmin <= etag <= rmax): 
+            if not (rmin <= etag <= rmax):
                 continue
             p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
             draw_member(p1, p2, colors['y_beams'], 3, 'Beam-Y', 'frames', etag=etag, etype='beam-y')
 
-    # Walls (wireframe with compact hover)
+    # Walls: draw as a single solid gray panel (fully opaque, no outlines)
     if options.get('show_walls', True):
         for etag, conn in walls:
-            if not (rmin <= etag <= rmax): 
+            if not (rmin <= etag <= rmax):
                 continue
             pts = [_safe_get(nodes, int(n)) for n in conn]
-            hover = _build_hover_for_element(etag, 'wall', damage_df, per_ele_val, heatmap_mode) if show_damage else f"<b>Element</b>: {etag}  <b>Type</b>: wall"
-            _add_wall_wireframe(fig, pts, colors['walls'], width=2, legendgroup='walls', hovertext=hover)
+            hover = f"<b>Element</b>: {etag}  <b>Type</b>: wall"
+            _add_wall_face(
+                fig, pts,
+                face_color=colors['walls'],
+                opacity=1.0,                   # completely solid
+                legendgroup='walls',
+                hovertext=hover
+            )
 
     # Node cloud
     if options.get('show_nodes', True):
         nodes_in_range: set[int] = set()
         for etag, conn in elements.items():
             et = int(etag)
-            if not (rmin <= et <= rmax): 
+            if not (rmin <= et <= rmax):
                 continue
             for n in conn:
                 nodes_in_range.add(int(n))
@@ -396,10 +411,14 @@ def create_interactive_plot(
                     showlegend=False, hoverinfo='skip'
                 ))
 
-    # Colorbar for damage view
-    if show_damage and per_ele_val:
-        cb_title = 'Ductility Demand' if heatmap_mode == 'ductility' else 'Estimated Cost ($)'
-        _add_colorbar(fig, cs, vmin, vmax, cb_title)
+    # Colorbar for damage view (from beams/columns only; walls stay solid gray)
+    if show_damage:
+        # If there are values from any non-wall members, show the colorbar
+        non_wall_vals = [v for et, v in per_ele_val.items() if et not in {w[0] for w in walls}]
+        if non_wall_vals:
+            vmin2, vmax2 = _normalize(non_wall_vals)
+            cb_title = 'Ductility Demand' if heatmap_mode == 'ductility' else 'Estimated Cost ($)'
+            _add_colorbar(fig, cs, vmin2, vmax2, cb_title)
 
     # Layout
     fig.update_layout(
