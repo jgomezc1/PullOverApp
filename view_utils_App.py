@@ -1,340 +1,501 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Jul 25 15:13:55 2025
+Lightweight 3D viewer helpers for PullOver_App
 
-@author: jgomez
-
-Notes:
-- This file keeps the original visualization features (ductility/cost heatmap,
-  labels, walls as Mesh3D, highlight nodes, annotations, camera presets).
-- The only behavioral change is how FRAME line widths are chosen so that beams
-  and columns match the "referent" visual quality:
-    * beams: 2px (default)
-    * columns: 3px (default)
-  You can override via options['beam_thickness'] / options['column_thickness'].
+Public API (used by the app):
+- classify_elements(nodes, elements) -> (x_beams, y_beams, columns, walls)
+- create_interactive_plot(
+      nodes, elements, damage_map=None, damage_df=None, options=None,
+      highlight_nodes_list=None, node_labels_dict=None,
+      heatmap_mode='ductility', base_cost=15000.0
+  )
 """
+from __future__ import annotations
+
+from typing import Dict, Tuple, List, Optional, Iterable
+import math
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from openseespy.opensees import getNodeTags, nodeCoord, getEleTags, eleNodes
+from plotly.colors import sample_colorscale
 
+# -------------------------------
+# Element classification
+# -------------------------------
 
-def order_rectangle_points(pts):
-    """Helper function to order vertices of a 4-node element for plotting."""
-    pts = np.array(pts)
-    center = np.mean(pts, axis=0)
-    v1 = pts[1] - pts[0]
-    v2 = pts[2] - pts[0]
-    # If nearly colinear, fall back to lexicographic order for stability
-    if np.linalg.norm(np.cross(v1, v2)) < 1e-8:
-        indices = np.lexsort((pts[:, 2], pts[:, 1], pts[:, 0]))
-        return [tuple(p) for p in pts[indices]]
+def classify_elements(nodes: Dict[int, Tuple[float, float, float]],
+                      elements: Dict[int, Tuple[int, ...]]
+                     ) -> Tuple[List[Tuple[int, Tuple[int, ...]]],
+                                List[Tuple[int, Tuple[int, ...]]],
+                                List[Tuple[int, Tuple[int, ...]]],
+                                List[Tuple[int, Tuple[int, ...]]]]:
+    """Classify 2-node elements into x_beams, y_beams, columns; 4-node as walls.
+    Returns lists of (ele_tag, conn).
+    """
+    x_beams: List[Tuple[int, Tuple[int, ...]]] = []
+    y_beams: List[Tuple[int, Tuple[int, ...]]] = []
+    columns: List[Tuple[int, Tuple[int, ...]]] = []
+    walls:   List[Tuple[int, Tuple[int, ...]]] = []
 
-    normal = np.cross(v1, v2)
-    normal = normal / np.linalg.norm(normal)
-
-    def project(p):
-        vec = p - center
-        u = np.dot(vec, v1)
-        v = np.dot(vec, np.cross(normal, v1))
-        return np.array([u, v])
-
-    projected = np.array([project(p) for p in pts])
-    angles = np.arctan2(projected[:, 1], projected[:, 0])
-    order = np.argsort(angles)
-
-    return [tuple(pts[i]) for i in order]
-
-
-def classify_elements(nodes, elements):
-    """Classifies elements into beams, columns, and walls based on geometry."""
-    x_beams, y_beams, columns, walls = [], [], [], []
     for ele_tag, conn in elements.items():
-        if not all(n in nodes for n in conn):
+        if not conn:
             continue
-        pts = [np.array(nodes[n]) for n in conn]
         if len(conn) == 2:
-            delta = pts[1] - pts[0]
-            dx, dy, dz = np.abs(delta)
-            if dz > max(dx, dy) * 0.95:
-                columns.append((ele_tag, conn))
-            elif dx >= dy:
-                x_beams.append((ele_tag, conn))
+            n1, n2 = int(conn[0]), int(conn[1])
+            p1, p2 = nodes.get(n1), nodes.get(n2)
+            if p1 is None or p2 is None:
+                continue
+            dx, dy, dz = (p2[0] - p1[0]), (p2[1] - p1[1]), (p2[2] - p1[2])
+            adx, ady, adz = abs(dx), abs(dy), abs(dz)
+            # Column if vertical dominates
+            if adz >= max(adx, ady) * 1.2:
+                columns.append((int(ele_tag), (n1, n2)))
             else:
-                y_beams.append((ele_tag, conn))
+                if adx >= ady:
+                    x_beams.append((int(ele_tag), (n1, n2)))
+                else:
+                    y_beams.append((int(ele_tag), (n1, n2)))
         elif len(conn) == 4:
-            walls.append((ele_tag, conn))
+            walls.append((int(ele_tag), tuple(int(n) for n in conn)))
+        else:
+            # Fallback: still draw it
+            x_beams.append((int(ele_tag), tuple(int(n) for n in conn)))
     return x_beams, y_beams, columns, walls
 
+# -------------------------------
+# Colors & scales
+# -------------------------------
 
-def add_legend_items(fig, damage_map=None, heatmap_mode='ductility', base_cost=15000):
+def _default_colors() -> Dict[str, str]:
+    return {
+        'columns':   'rgb(20,80,200)',
+        'x_beams':   'rgb(20,160,80)',
+        'y_beams':   'rgb(200,120,20)',
+        'walls':     'rgb(150,150,150)',  # solid wall gray
+        'nodes':     'rgb(60,60,60)',
+        'highlight': 'rgb(200,30,30)',
+        'labels':    'black'
+    }
+
+def _colorscale() -> List[List[object]]:
+    # Low→High
+    return [
+        [0.00, 'rgb(230,245,255)'],
+        [0.15, 'rgb(179,205,227)'],
+        [0.35, 'rgb(140,150,198)'],
+        [0.55, 'rgb(136,86,167)'],
+        [0.75, 'rgb(129,15,124)'],
+        [1.00, 'rgb(77,0,75)'],
+    ]
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+def _safe_get(d: Dict[int, Tuple[float, float, float]], key: int) -> Tuple[float, float, float]:
+    v = d.get(int(key))
+    if v is None:
+        return (float('nan'),) * 3
+    return (float(v[0]), float(v[1]), float(v[2]))
+
+def _value_from_damage(ele_tag: int,
+                       heatmap_mode: str,
+                       damage_map: Optional[Dict[int, dict]],
+                       damage_df: Optional[pd.DataFrame],
+                       base_cost: float) -> Optional[float]:
+    """Return the scalar value to color the element (ductility or cost)."""
+    val: Optional[float] = None
+    if heatmap_mode == 'ductility':
+        if isinstance(damage_df, pd.DataFrame) and not damage_df.empty and 'Element' in damage_df.columns:
+            row = damage_df.loc[damage_df['Element'] == ele_tag]
+            if not row.empty:
+                duct_cols = [c for c in damage_df.columns if c.startswith('Ductility')]
+                if duct_cols:
+                    try:
+                        val = float(np.nanmax(row[duct_cols].astype(float).values))
+                    except Exception:
+                        val = None
+        if val is None and damage_map and ele_tag in damage_map:
+            dm = damage_map.get(ele_tag, {})
+            for k in ('max_ductility','ductility','mu','max_mu'):
+                if k in dm:
+                    try:
+                        val = float(dm[k])
+                    except Exception:
+                        pass
+                    break
+    else:  # 'cost'
+        if isinstance(damage_df, pd.DataFrame) and not damage_df.empty and \
+           ('Element' in damage_df.columns) and ('Estimated Cost ($)' in damage_df.columns):
+            row = damage_df.loc[damage_df['Element'] == ele_tag]
+            if not row.empty:
+                try:
+                    val = float(row['Estimated Cost ($)'].iloc[0])
+                except Exception:
+                    val = None
+        if val is None and damage_map and ele_tag in damage_map:
+            dm = damage_map.get(ele_tag, {})
+            if any(isinstance(v, str) and v.lower() == 'damaged' for v in dm.values()):
+                val = float(base_cost)
+    return val
+
+def _normalize(values: List[float]) -> Tuple[float, float]:
+    if not values:
+        return (0.0, 1.0)
+    vmin = min(values); vmax = max(values)
+    if not math.isfinite(vmin) or not math.isfinite(vmax):
+        return (0.0, 1.0)
+    if vmax <= vmin:
+        return (vmin, vmin + 1.0)
+    return (vmin, vmax)
+
+def _map_value_to_color(val: float, vmin: float, vmax: float, cs: List[List[object]]) -> str:
+    t = 0.0 if vmax <= vmin else (val - vmin) / (vmax - vmin)
+    t = max(0.0, min(1.0, float(t)))
+    return sample_colorscale(cs, t)[0]
+
+# ---- New: merge 4-noded quads into continuous wall panels ----
+
+def _round(v: float, p: int = 3) -> float:
+    return float(np.round(v, p))
+
+def _wall_panel_groups(
+    walls: List[Tuple[int, Tuple[int, ...]]],
+    nodes: Dict[int, Tuple[float, float, float]],
+    tol_plane: float = 1e-3
+) -> List[dict]:
     """
-    Adds dummy traces for the legend and the appropriate color bar based on the view mode.
-    (Legend items are purely illustrative; they don’t affect geometry.)
+    Merge per-story 4-noded wall quads into continuous vertical panels.
+    We detect plane orientation (X≈const or Y≈const), then group by:
+      (plane, plane_value_rounded, other_axis_edge_pair_rounded)
+    Returns a list of panels with rectangle extents.
     """
-    # A generic frame sample; actual line widths are set per-element in the main loop.
-    fig.add_trace(go.Scatter3d(
-        x=[None], y=[None], z=[None], mode='lines',
-        line=dict(color='#cccccc', width=3),  # 3 ~ column default thickness
-        name='Frame (Elastic)'
-    ))
+    groups: Dict[Tuple, dict] = {}
+
+    for _etag, conn in walls:
+        pts = [_safe_get(nodes, int(n)) for n in conn]
+        xs = np.array([p[0] for p in pts], dtype=float)
+        ys = np.array([p[1] for p in pts], dtype=float)
+        zs = np.array([p[2] for p in pts], dtype=float)
+
+        rx = float(xs.max() - xs.min())
+        ry = float(ys.max() - ys.min())
+        rz = float(zs.max() - zs.min())
+
+        # Decide plane: walls are vertical; one horizontal axis is ~constant (thickness)
+        if rx <= tol_plane and ry > tol_plane:
+            # X ≈ constant -> plane is YZ
+            plane = 'X'
+            pval = _round(xs.mean(), 3)
+            # Signature by the two distinct Y edges along the wall width
+            y0, y1 = _round(float(ys.min()), 3), _round(float(ys.max()), 3)
+            sig = (plane, pval, y0, y1)
+            if sig not in groups:
+                groups[sig] = {'plane': plane, 'pval': pval, 'a': y0, 'b': y1, 'zmin': float('inf'), 'zmax': float('-inf')}
+            groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+            groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+
+        elif ry <= tol_plane and rx > tol_plane:
+            # Y ≈ constant -> plane is XZ
+            plane = 'Y'
+            pval = _round(ys.mean(), 3)
+            x0, x1 = _round(float(xs.min()), 3), _round(float(xs.max()), 3)
+            sig = (plane, pval, x0, x1)
+            if sig not in groups:
+                groups[sig] = {'plane': plane, 'pval': pval, 'a': x0, 'b': x1, 'zmin': float('inf'), 'zmax': float('-inf')}
+            groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+            groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+        else:
+            # Fallback: choose the axis with smaller spread as the "plane" axis
+            if rx <= ry:
+                plane = 'X'
+                pval = _round(xs.mean(), 3)
+                y0, y1 = _round(float(ys.min()), 3), _round(float(ys.max()), 3)
+                sig = (plane, pval, y0, y1)
+                if sig not in groups:
+                    groups[sig] = {'plane': plane, 'pval': pval, 'a': y0, 'b': y1, 'zmin': float('inf'), 'zmax': float('-inf')}
+                groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+                groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+            else:
+                plane = 'Y'
+                pval = _round(ys.mean(), 3)
+                x0, x1 = _round(float(xs.min()), 3), _round(float(xs.max()), 3)
+                sig = (plane, pval, x0, x1)
+                if sig not in groups:
+                    groups[sig] = {'plane': plane, 'pval': pval, 'a': x0, 'b': x1, 'zmin': float('inf'), 'zmax': float('-inf')}
+                groups[sig]['zmin'] = min(groups[sig]['zmin'], float(zs.min()))
+                groups[sig]['zmax'] = max(groups[sig]['zmax'], float(zs.max()))
+
+    return list(groups.values())
+
+def _add_wall_panel_mesh(fig: go.Figure, panel: dict, color: str, hover: Optional[str]) -> None:
+    """
+    panel: {'plane': 'X'|'Y', 'pval': float, 'a': float, 'b': float, 'zmin': float, 'zmax': float}
+    Draws a single opaque rectangle (two triangles).
+    """
+    plane, pval, a, b, z0, z1 = panel['plane'], panel['pval'], panel['a'], panel['b'], panel['zmin'], panel['zmax']
+
+    if plane == 'X':
+        # Rectangle in YZ at x = pval
+        pts = [(pval, a, z0), (pval, b, z0), (pval, b, z1), (pval, a, z1)]
+    else:
+        # Rectangle in XZ at y = pval
+        pts = [(a, pval, z0), (b, pval, z0), (b, pval, z1), (a, pval, z1)]
+
+    x = [p[0] for p in pts]
+    y = [p[1] for p in pts]
+    z = [p[2] for p in pts]
+    # Indices for two triangles
+    i = [0, 0]
+    j = [1, 2]
+    k = [2, 3]
+
     fig.add_trace(go.Mesh3d(
-        x=[0], y=[0], z=[0], i=[0], j=[0], k=[0],
-        color='lightblue', opacity=0.4, name='Wall (Elastic)'
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=color,
+        opacity=1.0,                 # completely solid
+        flatshading=True,
+        lighting=dict(ambient=0.9, diffuse=0.9, specular=0.0, roughness=1.0),
+        name='Wall',
+        hoverinfo='text' if hover else 'skip',
+        hovertemplate=(hover + '<extra></extra>') if hover else None,
+        showscale=False
     ))
+
+# -------------------------------
+
+def _add_colorbar(fig: go.Figure, cs: List[List[object]], vmin: float, vmax: float, title_text: str) -> None:
     fig.add_trace(go.Scatter3d(
         x=[None], y=[None], z=[None], mode='markers',
-        marker=dict(size=12, color='cyan', symbol='diamond', line=dict(color='black', width=2)),
-        name='Instrumented Node'
+        marker=dict(
+            size=0.1,
+            color=[vmin, vmax],
+            colorscale=cs,
+            cmin=vmin, cmax=vmax,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text=title_text, side='right')
+            )
+        ),
+        showlegend=False, hoverinfo='none'
     ))
-    # Structural node
-    fig.add_trace(go.Scatter3d(
-        x=[None], y=[None], z=[None], mode='markers',
-        marker=dict(size=4, color='black', opacity=0.8),
-        name='Structural Node'
-    ))
 
-    # Optional continuous colorbar for damage overlays
-    if damage_map:
-        marker_colors = ['#fee090', '#fdae61', '#d73027']  # Yellow, Orange, Red
-        custom_colorscale = [[0.0, marker_colors[0]], [0.5, marker_colors[1]], [1.0, marker_colors[2]]]
+def _build_hover_for_element(
+    etag: int,
+    etype: str,
+    damage_df: Optional[pd.DataFrame],
+    per_ele_val: Dict[int, float],
+    heatmap_mode: str
+) -> str:
+    lines = [f"<b>Element</b>: {etag}  <b>Type</b>: {etype}"]
+    if isinstance(damage_df, pd.DataFrame) and not damage_df.empty and 'Element' in damage_df.columns:
+        row = damage_df.loc[damage_df['Element'] == etag]
+        if not row.empty:
+            if 'Damage State' in row.columns:
+                lines.append(f"<b>Damage</b>: {row['Damage State'].iloc[0]}")
+            if 'Estimated Cost ($)' in row.columns:
+                try:
+                    cost = float(row['Estimated Cost ($)'].iloc[0])
+                    lines.append(f"<b>Estimated Cost</b>: ${cost:,.0f}")
+                except Exception:
+                    pass
+            duct_cols = [c for c in row.columns if c.startswith('Ductility')]
+            if duct_cols:
+                try:
+                    vals = row[duct_cols].iloc[0].astype(float)
+                    lines.append(f"<b>Max Ductility</b>: {np.nanmax(vals):.2f}")
+                except Exception:
+                    pass
+    if etag in per_ele_val:
+        label = 'Ductility' if heatmap_mode=='ductility' else 'Estimated Cost'
+        val = per_ele_val[etag]
+        if heatmap_mode=='ductility':
+            lines.append(f"<b>{label}</b>: {val:.2f}")
+        else:
+            lines.append(f"<b>{label}</b>: ${val:,.0f}")
+    return "<br>".join(lines)
 
-        if heatmap_mode == 'ductility':
-            title_text, tickvals, ticktext = "Ductility Demand", [1, 2, 4], ["1: Yield", "2: Moderate", "4: High"]
-            cmin, cmax = 0, 5
-        else:  # Cost mode
-            title_text = "Repair Cost ($)"
-            cmin, cmax = 0, base_cost
-            tickvals = [0.15 * base_cost, 0.5 * base_cost, 1.0 * base_cost]
-            ticktext = [f"${v:,.0f}" for v in tickvals]
-
-        fig.add_trace(go.Scatter3d(
-            x=[None], y=[None], z=[None], mode='markers',
-            marker=dict(
-                colorscale=custom_colorscale, cmin=cmin, cmax=cmax, showscale=True,
-                colorbar=dict(
-                    title=dict(text=title_text, side="right"),
-                    tickmode="array", tickvals=tickvals, ticktext=ticktext, ticks="outside"
-                )
-            ),
-            hoverinfo='none', showlegend=False
-        ))
-
+# -------------------------------
+# Main plot
+# -------------------------------
 
 def create_interactive_plot(
-    nodes,
-    elements,
-    damage_map=None,
-    damage_df=None,
-    options=None,
-    highlight_nodes_list=None,
-    node_labels_dict=None,
-    heatmap_mode='ductility',
-    base_cost=15000
+    nodes: Dict[int, Tuple[float,float,float]],
+    elements: Dict[int, Tuple[int, ...]],
+    damage_map: Optional[Dict[int, dict]] = None,
+    damage_df: Optional[pd.DataFrame] = None,
+    options: Optional[dict] = None,
+    highlight_nodes_list: Optional[Iterable[int]] = None,
+    node_labels_dict: Optional[Dict[int, str]] = None,
+    heatmap_mode: str = 'ductility',
+    base_cost: float = 15000.0
 ):
-    """
-    Creates an interactive 3D Plotly figure with a dynamic heatmap for ductility or cost.
-    (Handles node and element label toggling.)
-    """
-    if options is None: options = {}
-    if damage_map is None: damage_map = {}
-    if highlight_nodes_list is None: highlight_nodes_list = []
-    if node_labels_dict is None: node_labels_dict = {}
+    """Build a 3D Plotly scene for the current model.
 
-    # NEW: allow caller to set line widths to match referent quality
-    beam_thickness = int(options.get('beam_thickness', 2))
-    column_thickness = int(options.get('column_thickness', 3))
+    Behaviour driven by *options* keys (all optional):
+        - 'element_range': (min_tag, max_tag) to filter
+        - 'show_columns'/'show_beams_x'/'show_beams_y'/'show_walls' (bool)
+        - 'show_nodes' (bool)
+        - 'show_node_labels' (bool)
+        - 'show_damage' (bool): if True, color members by heatmap_mode
+    """
+    options = options.copy() if isinstance(options, dict) else {}
+    colors = _default_colors()
+    cs = _colorscale()
 
+    # Filter range
+    tags = [int(t) for t in elements.keys()] or [0]
+    rmin, rmax = (min(tags), max(tags))
+    if 'element_range' in options and options['element_range']:
+        try:
+            rmin = max(rmin, int(options['element_range'][0]))
+            rmax = min(rmax, int(options['element_range'][1]))
+        except Exception:
+            pass
+
+    # Classify elements
+    x_beams, y_beams, columns, walls = classify_elements(nodes, elements)
+
+    # Prepare damage values (used for beams/columns only)
+    show_damage = bool(options.get('show_damage', False))
+    per_ele_val: Dict[int, float] = {}
+    vmin, vmax = 0.0, 1.0
+    if show_damage and (heatmap_mode in ('ductility','cost')):
+        tmp_vals: List[float] = []
+        for etag in elements.keys():
+            et = int(etag)
+            if not (rmin <= et <= rmax):
+                continue
+            val = _value_from_damage(et, heatmap_mode, damage_map, damage_df, base_cost)
+            if val is not None and math.isfinite(val):
+                per_ele_val[et] = float(val)
+                tmp_vals.append(float(val))
+        vmin, vmax = _normalize(tmp_vals)
+
+    # Create figure
     fig = go.Figure()
 
-    # NEW: scene annotations buffer for labels
-    scene_annotations = []
+    # Helper to draw 2-node element with optional heat color and hover
+    def draw_member(p1, p2, color, width: int, name: str, group: str, etag: Optional[int]=None, etype: Optional[str]=None):
+        line_color = color
+        if show_damage and etag is not None and etag in per_ele_val:
+            line_color = _map_value_to_color(per_ele_val[etag], vmin, vmax, cs)
+        hovertext = None
+        if etag is not None and etype is not None:
+            hovertext = _build_hover_for_element(etag, etype, damage_df, per_ele_val, heatmap_mode)
+        fig.add_trace(go.Scatter3d(
+            x=[p1[0], p2[0]], y=[p1[1], p2[1]], z=[p1[2], p2[2]],
+            mode='lines',
+            line=dict(color=line_color, width=width),
+            name=name, showlegend=False, legendgroup=group,
+            hoverinfo='text' if hovertext else 'none',
+            hovertemplate=(hovertext + '<extra></extra>') if hovertext else None
+        ))
 
-    if not nodes:
-        fig.add_annotation(
-            x=0.5, y=0.5, text="Model not built yet.", showarrow=False,
-            xref="paper", yref="paper", font=dict(size=20, color="gray")
-        )
-        fig.update_layout(
-            scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-            height=600, width=800
-        )
-        return fig
+    # Columns
+    if options.get('show_columns', True):
+        for etag, conn in columns:
+            if not (rmin <= etag <= rmax):
+                continue
+            p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
+            draw_member(p1, p2, colors['columns'], 5, 'Column', 'columns', etag=etag, etype='column')
 
-    damage_df_indexed, ductility_cols = None, []
-    if damage_df is not None and not damage_df.empty and 'Element' in damage_df.columns:
-        damage_df_indexed = damage_df.set_index('Element')
-        ductility_cols = [c for c in damage_df.columns if 'Ductility' in c]
+    # X beams
+    if options.get('show_beams_x', True):
+        for etag, conn in x_beams:
+            if not (rmin <= etag <= rmax):
+                continue
+            p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
+            draw_member(p1, p2, colors['x_beams'], 3, 'Beam-X', 'frames', etag=etag, etype='beam-x')
 
-    x_beams, y_beams, columns, walls = classify_elements(nodes, elements)
-    min_ele, max_ele = options.get(
-        'element_range',
-        (min(elements.keys(), default=0), max(elements.keys(), default=1))
-    )
+    # Y beams
+    if options.get('show_beams_y', True):
+        for etag, conn in y_beams:
+            if not (rmin <= etag <= rmax):
+                continue
+            p1, p2 = _safe_get(nodes, int(conn[0])), _safe_get(nodes, int(conn[1]))
+            draw_member(p1, p2, colors['y_beams'], 3, 'Beam-Y', 'frames', etag=etag, etype='beam-y')
 
-    # Nodes (always added here; visibility can be controlled upstream if needed)
-    node_x, node_y, node_z, node_labels = [], [], [], []
-    for tag, coords in nodes.items():
-        node_x.append(coords[0]); node_y.append(coords[1]); node_z.append(coords[2])
-        node_labels.append(f"Node: {tag}<br>Coords: ({coords[0]:.2f}, {coords[1]:.2f}, {coords[2]:.2f})")
-        if options.get('show_node_labels', False):
-            scene_annotations.append(dict(
-                x=coords[0], y=coords[1], z=coords[2], text=str(tag), showarrow=False,
-                font=dict(color='black', size=10), bgcolor='rgba(255, 255, 255, 0.6)'
-            ))
+    # Walls: merge all 4-noded quads into a SINGLE solid panel per stack
+    if options.get('show_walls', True) and walls:
+        # Build panels from all wall quads
+        all_panels = _wall_panel_groups(walls, nodes, tol_plane=1e-4)
+        for panel in all_panels:
+            # Keep per-wall simple gray look (as per requirement)
+            hover = "Wall panel"
+            _add_wall_panel_mesh(fig, panel, color=colors['walls'], hover=hover)
 
-    fig.add_trace(go.Scatter3d(
-        x=node_x, y=node_y, z=node_z, mode='markers',
-        marker=dict(size=4, color='black', opacity=0.8),
-        hoverinfo='text', text=node_labels, name='Nodes', showlegend=False
-    ))
+    # Node cloud
+    if options.get('show_nodes', True):
+        nodes_in_range: set[int] = set()
+        for etag, conn in elements.items():
+            et = int(etag)
+            if not (rmin <= et <= rmax):
+                continue
+            for n in conn:
+                nodes_in_range.add(int(n))
+        if highlight_nodes_list:
+            for n in highlight_nodes_list:
+                nodes_in_range.add(int(n))
+        if not elements:
+            nodes_in_range = set(int(n) for n in nodes.keys())
 
-    # Flatten for iteration while preserving original granularity
-    all_elements = [('frame', item) for item in (x_beams + y_beams + columns)] + [('wall', item) for item in walls]
+        xs, ys, zs = [], [], []
+        for nid in nodes_in_range:
+            x, y, z = _safe_get(nodes, int(nid))
+            xs.append(x); ys.append(y); zs.append(z)
+        fig.add_trace(go.Scatter3d(
+            x=xs, y=ys, z=zs, mode='markers',
+            marker=dict(size=2, color=_default_colors()['nodes']),
+            name='Nodes', showlegend=False, hoverinfo='skip'
+        ))
 
-    for ele_type, (ele_tag, conn) in all_elements:
-        if not (min_ele <= ele_tag <= max_ele):
-            continue
-        if (ele_type == 'frame' and not options.get('show_frames', True)) or \
-           (ele_type == 'wall' and not options.get('show_walls', True)):
-            continue
-
-        pts = np.array([nodes[n] for n in conn])
-        is_damaged = options.get('show_damage', True) and ele_tag in damage_map
-
-        # Element labels
-        if options.get('show_element_labels', False):
-            center_pt = np.mean(pts, axis=0)
-            scene_annotations.append(dict(
-                x=center_pt[0], y=center_pt[1], z=center_pt[2], text=str(ele_tag), showarrow=False,
-                font=dict(color='purple', size=10, family="Arial Black"),
-                bgcolor='rgba(255, 255, 255, 0.7)'
-            ))
-
-        color = '#cccccc' if ele_type == 'frame' else 'lightblue'
-        opacity = 1.0 if ele_type == 'frame' else 0.4
-        max_ductility, cost, rcf = 0.0, 0.0, 0.0
-
-        # --- NEW: choose beam/column thickness like the referent viewer ---
-        # We do NOT change what is visualized; only the base line width policy.
-        if ele_type == 'frame' and len(conn) == 2:
-            delta = pts[1] - pts[0]
-            dx, dy, dz = np.abs(delta)
-            is_column_geom = dz > max(dx, dy) * 0.95
-            base_width = column_thickness if is_column_geom else beam_thickness
-            line_width = base_width
-        else:
-            line_width = None  # Walls handled by Mesh3d
-
-        # Damage-driven styling (keep your original overlay behavior)
-        if is_damaged and damage_df_indexed is not None and ele_tag in damage_df_indexed.index:
-            if ele_type == 'frame':
-                # Thicken but keep relative distinction vs. base widths
-                line_width = max((line_width or 0) + 3, (line_width or 0) * 2 or 6)
-            else:
-                opacity = 0.7
-            if ductility_cols:
-                max_ductility = float(damage_df_indexed.loc[ele_tag][ductility_cols].max())
-            if 'Estimated Cost ($)' in damage_df_indexed.columns:
-                cost = float(damage_df_indexed.loc[ele_tag]['Estimated Cost ($)'])
-                rcf = float(damage_df_indexed.loc[ele_tag].get('Repair Cost Factor', 0.0))
-
-            value_for_coloring = max_ductility if heatmap_mode == 'ductility' else rcf
-            if value_for_coloring >= (4.0 if heatmap_mode == 'ductility' else 1.0):
-                color = '#d73027'
-            elif value_for_coloring >= (2.0 if heatmap_mode == 'ductility' else 0.5):
-                color = '#fdae61'
-            elif value_for_coloring >= (1.0 if heatmap_mode == 'ductility' else 0.15):
-                color = '#fee090'
-
-        duct_text = f"<b>{max_ductility:.2f}</b>" if heatmap_mode == 'ductility' else f"{max_ductility:.2f}"
-        cost_text = f"<b>${cost:,.0f}</b>" if heatmap_mode == 'cost' else f"${cost:,.0f}"
-        hover_text = (
-            f"Element: {ele_tag}<br>"
-            f"Type: {'Frame' if ele_type=='frame' else 'Wall'}<br>"
-            f"Max Ductility: {duct_text}<br>"
-            f"Est. Cost: {cost_text}"
-        )
-
-        if ele_type == 'frame':
+        # Highlighted nodes
+        if highlight_nodes_list:
+            hx, hy, hz = [], [], []
+            for nid in highlight_nodes_list:
+                x, y, z = _safe_get(nodes, int(nid))
+                hx.append(x); hy.append(y); hz.append(z)
             fig.add_trace(go.Scatter3d(
-                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode='lines',
-                line=dict(color=color, width=line_width),
-                hoverinfo='text', text=hover_text, showlegend=False
-            ))
-        else:
-            ordered_pts = order_rectangle_points(pts)
-            x_wall = [p[0] for p in ordered_pts]
-            y_wall = [p[1] for p in ordered_pts]
-            z_wall = [p[2] for p in ordered_pts]
-            fig.add_trace(go.Mesh3d(
-                x=x_wall, y=y_wall, z=z_wall, i=[0, 0], j=[1, 2], k=[2, 3],
-                opacity=opacity, color=color, hoverinfo='text', text=hover_text, showlegend=False
+                x=hx, y=hy, z=hz, mode='markers',
+                marker=dict(size=6, color=_default_colors()['highlight']),
+                name='Highlighted Nodes', showlegend=True, hoverinfo='skip'
             ))
 
-    # Highlight specific nodes (instrumented, etc.)
-    if highlight_nodes_list:
-        h_x, h_y, h_z, h_text = [], [], [], []
-        for node_id in highlight_nodes_list:
-            if node_id in nodes:
-                coords = nodes[node_id]
-                h_x.append(coords[0]); h_y.append(coords[1]); h_z.append(coords[2])
-                label = node_labels_dict.get(node_id, f"Node: {node_id}")
-                h_text.append(f"{label}<br>Coords: ({coords[0]:.2f}, {coords[1]:.2f}, {coords[2]:.2f})")
+        # Node labels
+        if options.get('show_node_labels', False) and node_labels_dict:
+            lx, ly, lz, ltxt = [], [], [], []
+            for nid in nodes_in_range:
+                if nid in node_labels_dict:
+                    x, y, z = _safe_get(nodes, int(nid))
+                    lx.append(x); ly.append(y); lz.append(z); ltxt.append(str(node_labels_dict[nid]))
+            if ltxt:
+                fig.add_trace(go.Scatter3d(
+                    x=lx, y=ly, z=lz, mode='text',
+                    text=ltxt, textposition='top center',
+                    textfont=dict(color='black', size=10),
+                    showlegend=False, hoverinfo='skip'
+                ))
 
-        if h_x:
-            fig.add_trace(go.Scatter3d(
-                x=h_x, y=h_y, z=h_z, mode='markers',
-                marker=dict(size=12, color='cyan', symbol='diamond', line=dict(color='black', width=2)),
-                hoverinfo='text', text=h_text, name='Instrumented Nodes', showlegend=False
-            ))
+    # Colorbar for damage view (from beams/columns only; walls stay solid gray)
+    if show_damage:
+        non_wall_vals = [v for et, v in per_ele_val.items() if et not in {w[0] for w in walls}]
+        if non_wall_vals:
+            vmin2, vmax2 = _normalize(non_wall_vals)
+            cb_title = 'Ductility Demand' if heatmap_mode == 'ductility' else 'Estimated Cost ($)'
+            _add_colorbar(fig, cs, vmin2, vmax2, cb_title)
 
-    # Legend & color bar
-    add_legend_items(fig, damage_map=damage_map, heatmap_mode=heatmap_mode, base_cost=base_cost)
-
-    # Layout & camera
-    all_coords = np.array(list(nodes.values()))
-    if all_coords.size > 0:
-        max_range_dim = max(np.ptp(all_coords[:, i]) for i in range(3))
-        mid_pt = np.mean(all_coords, axis=0)
-        scene_limits = {
-            f'{ax}axis': dict(
-                range=[mid_pt[i] - max_range_dim / 2 * 1.1, mid_pt[i] + max_range_dim / 2 * 1.1],
-                title=f'{ax.upper()} [m]'
-            )
-            for i, ax in enumerate('xyz')
-        }
-    else:
-        scene_limits = {f'{ax}axis': dict(title=f'{ax.upper()} [m]') for ax in 'xyz'}
-
-    view = options.get('view')
-    if view == 'Plan View':
-        camera_eye = dict(x=0, y=0, z=2.5)
-    elif view == 'Front View':
-        camera_eye = dict(x=0, y=-2.5, z=0)
-    elif view == 'Side View':
-        camera_eye = dict(x=2.5, y=0, z=0)
-    else:
-        camera_eye = dict(x=1.5, y=-1.5, z=1)
-
+    # Layout
     fig.update_layout(
-        scene=scene_limits,
-        scene_aspectmode='cube',
-        height=700,
-        margin=dict(l=0, r=0, b=0, t=0),
-        hovermode='closest',
-        scene_camera=dict(eye=camera_eye),
-        showlegend=True,
-        legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.7)')
+        margin=dict(l=0, r=0, t=0, b=0),
+        scene=dict(
+            xaxis=dict(title='X', showgrid=True, zeroline=False),
+            yaxis=dict(title='Y', showgrid=True, zeroline=False),
+            zaxis=dict(title='Z', showgrid=True, zeroline=False),
+            aspectmode='data'
+        ),
+        showlegend=False
     )
-
-    # Apply collected annotations
-    if scene_annotations:
-        fig.update_layout(scene_annotations=scene_annotations)
-
-    if not options.get('show_grid', True):
-        fig.update_layout(scene={f'{ax}axis_visible': False for ax in 'xyz'})
-
     return fig

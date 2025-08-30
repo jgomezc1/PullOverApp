@@ -7,15 +7,15 @@ Created on Mon Jul 28 22:55:10 2025
 
 import streamlit as st
 import os
-import importlib.util 
+import importlib.util
 import pandas as pd
 from openseespy.opensees import wipe, getNodeTags, nodeCoord, getEleTags, eleNodes
 import numpy as np
 import plotly.graph_objects as go
-import yaml 
-import zipfile 
-import tempfile 
-import sys 
+import yaml
+import zipfile
+import tempfile
+import sys
 import shutil
 
 # --- 1. PAGE CONFIGURATION (MUST BE THE FIRST STREAMLIT COMMAND) ---
@@ -26,8 +26,8 @@ st.set_page_config(
 )
 
 # Import the adapted helper modules
-import damage_detector_App as dam 
-import view_utils_App as vu      
+import damage_detector_App as dam
+import view_utils_App as vu
 
 # --- 2. HELPER FUNCTIONS ---
 @st.cache_data
@@ -51,7 +51,7 @@ if "project_config" not in st.session_state:
 if "model_built" not in st.session_state:
     st.session_state.model_built = False
 if "damage_detected" not in st.session_state:
-    st.session_state.damage_detected = False 
+    st.session_state.damage_detected = False
 if "nodes" not in st.session_state:
     st.session_state.nodes = {}
 if "elements" not in st.session_state:
@@ -59,9 +59,9 @@ if "elements" not in st.session_state:
 if "model_summary" not in st.session_state:
     st.session_state.model_summary = {}
 if "damage_map" not in st.session_state:
-    st.session_state.damage_map = {} 
+    st.session_state.damage_map = {}
 if "damage_df" not in st.session_state:
-    st.session_state.damage_df = pd.DataFrame() 
+    st.session_state.damage_df = pd.DataFrame()
 
 # --- 4. CUSTOM CSS ---
 st.markdown("""
@@ -90,30 +90,28 @@ st.markdown("""
         color: #004C82;
     }
 
-
     /* --- ADD THESE NEW STYLES --- */
     .custom-success-box {
-        border: 2px solid #28a745;      /* Green border */
+        border: 2px solid #28a745;
         border-radius: 10px;
-        padding: 25px;                  /* Increased padding for a larger box */
-        background-color: #d4edda;      /* Light green background */
-        color: #155724;                 /* Dark green text */
-        font-size: 1.15em;              /* Larger font */
+        padding: 25px;
+        background-color: #d4edda;
+        color: #155724;
+        font-size: 1.15em;
         font-weight: 500;
         margin-bottom: 1em;
     }
     .custom-warning-box {
-        border: 2px solid #fd7e14;      /* Orange border */
+        border: 2px solid #fd7e14;
         border-radius: 10px;
-        padding: 25px;                  /* Increased padding for a larger box */
-        background-color: #fff3cd;      /* Light orange background */
-        color: #856404;                 /* Dark orange text */
-        font-size: 1.15em;              /* Larger font */
+        padding: 25px;
+        background-color: #fff3cd;
+        color: #856404;
+        font-size: 1.15em;
         font-weight: 500;
         margin-bottom: 1em;
     }
     /* ------------------------------ */
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -138,8 +136,8 @@ if st.session_state.model_built and st.session_state.elements:
     max_ele_default = max(all_ele_tags) if all_ele_tags else 1
 
 selected_min_ele, selected_max_ele = st.sidebar.slider(
-    "Element ID Range", 
-    min_ele_default, max_ele_default, 
+    "Element ID Range",
+    min_ele_default, max_ele_default,
     (min_ele_default, max_ele_default),
     key="element_range_slider"
 )
@@ -148,10 +146,10 @@ view_options['element_range'] = (selected_min_ele, selected_max_ele)
 # --- Main Application Body ---
 col_logo_left, col_title, col_logo_right = st.columns([1, 4, 1])
 with col_logo_left:
-    st.image("company_logo.png", width=120) 
+    st.image("company_logo.png", width=120)
 with col_title:
     st.markdown("<h1 style='text-align: center; color: #004C82; font-size: 4.0em;'>StrucDamage</h1>", unsafe_allow_html=True)
-    st.markdown("<h2 style='text-align: center; color: #004C82;'>Real-time structural damage detection powered by PullOver™</h2>", unsafe_allow_html=True) 
+    st.markdown("<h2 style='text-align: center; color: #004C82;'>Real-time structural damage detection powered by PullOver™</h2>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center; color: #004C82;'>Edificio de Ingenierias-Universidad EAFIT</h3>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center;'>A product by <a href='https://www.risk-and-design.com/' target='_blank'>Risk and Design Consulting</a></p>", unsafe_allow_html=True)
 with col_logo_right:
@@ -166,27 +164,43 @@ with st.expander("STEP 0: Upload Project Package", expanded=True):
         help="The zip file should contain: model.py, analysis.py, project_config.yml, and an 'inputs' folder."
     )
     if uploaded_file is not None:
+        # Optional "reset & rerun" button
         if st.button("Load New Project"):
-             st.session_state.clear() 
-             st.rerun()
+            st.session_state.clear()
+            st.rerun()
 
+        # Extract ZIP once per session
         if st.session_state.project_path is None:
             temp_dir = tempfile.mkdtemp()
             with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
             st.session_state.project_path = temp_dir
             st.success(f"Project '{uploaded_file.name}' uploaded and extracted.")
-        
-        config_path = os.path.join(st.session_state.project_path, 'project_config.yml')
-        try:
-            with open(config_path, 'r') as f:
-                st.session_state.project_config = yaml.safe_load(f)
-            st.info("`project_config.yml` loaded successfully.")
-            with st.popover("View Configuration"):
-                st.json(st.session_state.project_config)
-        except Exception as e:
-            st.error(f"Error loading or parsing `project_config.yml`: {e}")
-            st.session_state.project_path = None
+
+            # Reset filters specific to previous projects (very important)
+            st.session_state.pop("element_range_slider", None)
+            # Also reset model flags
+            st.session_state.model_built = False
+            st.session_state.damage_detected = False
+
+        # Load project_config.yml (and show it)
+        if st.session_state.project_path:
+            config_path = os.path.join(st.session_state.project_path, 'project_config.yml')
+            try:
+                with open(config_path, 'r') as f:
+                    st.session_state.project_config = yaml.safe_load(f) or {}
+                st.info("`project_config.yml` loaded successfully.")
+                # Optional: show config in a popover if streamlit version supports it
+                if hasattr(st, "popover"):
+                    with st.popover("View Configuration"):
+                        st.json(st.session_state.project_config)
+                else:
+                    with st.expander("View Configuration (YAML)", expanded=False):
+                        st.json(st.session_state.project_config)
+            except Exception as e:
+                st.error(f"Error loading or parsing `project_config.yml`: {e}")
+                st.session_state.project_path = None
+                st.session_state.project_config = {}
 
 # --- Step 1: Build & Visualize Model ---
 with st.expander("STEP 1: Build & Visualize Model", expanded=True):
@@ -197,8 +211,8 @@ with st.expander("STEP 1: Build & Visualize Model", expanded=True):
         with col1:
             st.info("This step is for validating your `model.py` script.")
             if st.button("Build & Visualize Model", key="build_model_initial", use_container_width=True):
-                st.session_state.build_triggered = True 
-            
+                st.session_state.build_triggered = True
+
             if st.session_state.model_built:
                 st.success("✅ **Status:** Model Built Successfully")
                 st.markdown("---")
@@ -220,10 +234,10 @@ with st.expander("STEP 1: Build & Visualize Model", expanded=True):
                         model_script_path = os.path.join(st.session_state.project_path, 'model.py')
                         if not os.path.exists(model_script_path):
                             raise FileNotFoundError("`model.py` not found in the project package.")
-                        
+
                         user_model_module = load_module_from_path("user_model", model_script_path)
                         user_model_module.build_model()
-                        
+
                         try:
                             st.session_state.nodes = {tag: nodeCoord(tag) for tag in getNodeTags()}
                             st.session_state.elements = {tag: eleNodes(tag) for tag in getEleTags()}
@@ -264,20 +278,29 @@ with st.expander("STEP 1: Build & Visualize Model", expanded=True):
                         for key, value in st.session_state.building_metadata.items():
                             st.markdown(f"**{key.replace('_', ' ').title()}:** {value}")
                 with viz_col:
+                    # --- Enforce a valid tag range for the current model ---
+                    all_ele_tags = list(st.session_state.elements.keys())
+                    if all_ele_tags:
+                        _emin, _emax = min(all_ele_tags), max(all_ele_tags)
+                        _sel = st.session_state.get('element_range_slider', (_emin, _emax))
+                        try:
+                            _sel_min, _sel_max = int(_sel[0]), int(_sel[1])
+                        except Exception:
+                            _sel_min, _sel_max = _emin, _emax
+                        _sel_min = max(_emin, _sel_min)
+                        _sel_max = min(_emax, _sel_max)
+                        view_options['element_range'] = (_sel_min, _sel_max)
+
+                        # Small status badge: how many elements are currently within range?
+                        _in_range = sum(1 for _t in all_ele_tags if _sel_min <= _t <= _sel_max)
+                        st.caption(f"📐 Showing {_in_range} / {len(all_ele_tags)} elements (ID range {_sel_min}–{_sel_max}).")
+
                     fig = vu.create_interactive_plot(
                         nodes=st.session_state.nodes, elements=st.session_state.elements,
                         options=view_options, highlight_nodes_list=st.session_state.sub_nodes_for_plot,
                         node_labels_dict=st.session_state.sub_node_labels_for_plot
                     )
                     st.plotly_chart(fig, use_container_width=True, key="initial_model_visualization")
-
-
-#                    fig = vu.create_interactive_plot(
-#                        nodes=st.session_state.nodes, elements=st.session_state.elements,
-#                        options=view_options, highlight_nodes_list=st.session_state.sub_nodes_for_plot,
-#                        node_labels_dict=st.session_state.sub_node_labels_for_plot
-#                    )
-#                    st.plotly_chart(fig, use_container_width=True) 
             else:
                 st.info("Build the model to visualize the structure.")
 
@@ -291,7 +314,7 @@ if not st.session_state.get('model_built'):
 else:
     # --- NEW: View Input Data and Event Metadata ---
     st.subheader("Event Information & Input Data")
-    
+
     meta_col, plot_col = st.columns([1, 2])
 
     with meta_col:
@@ -316,7 +339,7 @@ else:
                 analysis_setup = st.session_state.project_config.get('analysis_setup', {})
                 instrumented_nodes = analysis_setup.get('instrumented_nodes', [])
                 dt = analysis_setup.get('dt', 0.02)
-                
+
                 if instrumented_nodes:
                     input_dir = os.path.join(st.session_state.project_path, 'inputs')
                     node_id = st.selectbox("Select Instrumented Node to View", instrumented_nodes)
@@ -329,7 +352,12 @@ else:
                             fig_disp = go.Figure()
                             fig_disp.add_trace(go.Scatter(x=time_vector, y=ux_data, mode='lines', name='Ux'))
                             fig_disp.add_trace(go.Scatter(x=time_vector, y=uy_data, mode='lines', name='Uy'))
-                            fig_disp.update_layout(title=f"Node {node_id} Displacement History", height=300, margin=dict(l=20,r=20,b=20,t=40), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                            fig_disp.update_layout(
+                                title=f"Node {node_id} Displacement History",
+                                height=300,
+                                margin=dict(l=20, r=20, b=20, t=40),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                            )
                             st.plotly_chart(fig_disp, use_container_width=True)
                         else:
                             st.warning(f"Input files for node {node_id} not found in 'inputs' folder.")
@@ -338,7 +366,6 @@ else:
         except Exception as e:
             st.error(f"Could not load input data plot: {e}")
     st.markdown("---")
-
 
     # --- BATCH SELECTION LOGIC ---
     try:
@@ -350,7 +377,7 @@ else:
 
         batch_size = 100
         all_batches = [all_elements_to_record[i:i + batch_size] for i in range(0, len(all_elements_to_record), batch_size)]
-        
+
         batch_options = []
         for i, batch in enumerate(all_batches):
             if batch:
@@ -367,7 +394,7 @@ else:
         st.error(f"Could not define batches from project_config.yml: {e}")
         selected_batch_strs = []
 
-    b_col1, b_col2, b_col3 = st.columns([2,2,1])
+    b_col1, b_col2, b_col3 = st.columns([2, 2, 1])
 
     # Button to run the full batched workflow
     if b_col1.button("Run Batched Workflow", key="run_workflow", use_container_width=True, type="primary"):
@@ -375,24 +402,26 @@ else:
             st.warning("Please select at least one batch to analyze.")
         else:
             try:
-                if os.path.exists('damage'): shutil.rmtree('damage')
-                if os.path.exists('outputs'): shutil.rmtree('outputs')
+                if os.path.exists('damage'):
+                    shutil.rmtree('damage')
+                if os.path.exists('outputs'):
+                    shutil.rmtree('outputs')
 
                 with st.spinner("Starting batched workflow..."):
                     status_text = st.empty()
                     progress_bar = st.progress(0)
-                    
+
                     selected_indices = [batch_options.index(s) for s in selected_batch_strs]
                     batches_to_run = [all_batches[i] for i in selected_indices]
-                    
+
                     project_path = st.session_state.project_path
                     user_model_module = load_module_from_path("user_model", os.path.join(project_path, 'model.py'))
                     user_analysis_module = load_module_from_path("user_analysis", os.path.join(project_path, 'analysis.py'))
-                    
+
                     analysis_params = st.session_state.project_config.get('analysis_setup', {})
                     damage_config = st.session_state.project_config.get('damage_detection', {})
                     analysis_params['inputs_dir'] = os.path.join(project_path, 'inputs')
-                    
+
                     total_batches = len(batches_to_run)
                     for i, batch in enumerate(batches_to_run):
                         status_text.info(f"Running Analysis Batch {i+1} of {total_batches} (Elements {batch[0]}-{batch[-1]})")
@@ -406,17 +435,17 @@ else:
                         )
 
                     status_text.info("All selected batches complete. Detecting damage...")
-                    
+
                     damage_dir = 'damage'
                     df, d_map = dam.detect_damaged_elements_by_moment(
                         damage_config=damage_config,
                         damage_dir=damage_dir
                     )
-                    
+
                     st.session_state.damage_df = df
                     st.session_state.damage_map = d_map
                     st.session_state.damage_detected = True
-                
+
                 st.rerun()
 
             except Exception as e:
@@ -487,10 +516,15 @@ if st.session_state.damage_detected:
 
         st.subheader("Damage Summary Report")
         st.dataframe(damage_df_display, use_container_width=True, height=300)
-        
+
         if not damage_df_display.empty:
-            st.download_button("📥 Download Summary (CSV)", convert_df_to_csv(damage_df_display),
-                               'damage_summary.csv', 'text/csv', use_container_width=True)
+            st.download_button(
+                "📥 Download Summary (CSV)",
+                convert_df_to_csv(damage_df_display),
+                'damage_summary.csv',
+                'text/csv',
+                use_container_width=True
+            )
 
     with main_viz_col:
         st.subheader("Interactive 3D Structure View")
@@ -499,9 +533,9 @@ if st.session_state.damage_detected:
         base_cost = st.session_state.project_config.get('damage_detection', {}).get('base_cost_per_element', 15000)
 
         fig = vu.create_interactive_plot(
-            nodes=st.session_state.nodes, 
+            nodes=st.session_state.nodes,
             elements=st.session_state.elements,
-            damage_map=st.session_state.damage_map, 
+            damage_map=st.session_state.damage_map,
             damage_df=st.session_state.damage_df,
             options=view_options,
             highlight_nodes_list=st.session_state.sub_nodes_for_plot,
@@ -515,8 +549,12 @@ if st.session_state.damage_detected:
         if not damage_df_display.empty:
             all_damaged_ele_ids = sorted(damage_df_display['Element'].tolist())
             default_selection = all_damaged_ele_ids[:9] if len(all_damaged_ele_ids) >= 9 else all_damaged_ele_ids
-            selected_elements_to_plot = st.multiselect("Select Elements to Plot M-κ", all_damaged_ele_ids, default=default_selection)
-            
+            selected_elements_to_plot = st.multiselect(
+                "Select Elements to Plot M-κ",
+                all_damaged_ele_ids,
+                default=default_selection
+            )
+
             plot_info = {}
             df_subset = damage_df_display.set_index('Element')
             for ele_id in selected_elements_to_plot:
@@ -536,7 +574,6 @@ if st.session_state.damage_detected:
                     yield_params_config=yield_params_config,
                     num_cols=3
                 )
-                st.plotly_chart(fig_mk_multi, use_container_width=True , key="moment_curvature_plots")
+                st.plotly_chart(fig_mk_multi, use_container_width=True, key="moment_curvature_plots")
 else:
     st.info("Run a workflow in Step 2 to view the dashboard.")
-
